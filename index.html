@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>Strategic Othello EXTREME - Online</title>
+    <script src="/socket.io/socket.io.js"></script>
+    <style>
+        :root { --bg-black: #1a252f; --bg-white: #e8f5e9; --bg-red: #3e1a1a; --board-green: #2e7d32; --gold: #ffd700; }
+        body { font-family: sans-serif; margin: 0; display: flex; flex-direction: column; align-items: center; background: #111; color: #fff; transition: 0.5s; overflow: hidden; }
+        body.black-turn { background-color: var(--bg-black); }
+        body.white-turn { background-color: var(--bg-white); color: #333; }
+        body.red-turn { background-color: var(--bg-red); }
+        
+        .overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.9); z-index: 1000; display: flex; justify-content: center; align-items: center; }
+        .modal { background: #222; padding: 25px; border-radius: 15px; text-align: center; border: 2px solid var(--gold); width: 320px; }
+        
+        .game-container { display: flex; gap: 15px; padding: 10px; align-items: flex-start; }
+        .board { display: grid; background: var(--board-green); border: 5px solid #1b5e20; }
+        .cell { border: 0.5px solid rgba(255,255,255,0.1); display: flex; justify-content: center; align-items: center; cursor: pointer; position: relative; }
+        .cell.bonus { background: rgba(255, 215, 0, 0.3); }
+        .cell.bonus::after { content: '★'; color: var(--gold); font-size: 14px; position: absolute; font-weight: bold; }
+        
+        .stone { border-radius: 50%; width: 85%; height: 85%; transition: 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
+        .black { background: radial-gradient(circle at 30% 30%, #444, #000); }
+        .white { background: radial-gradient(circle at 30% 30%, #fff, #ccc); }
+        .red { background: radial-gradient(circle at 30% 30%, #ff5555, #880000); }
+        .hint { width: 10px; height: 10px; background: rgba(255,255,255,0.3); border-radius: 50%; }
+
+        .side-area { width: 120px; display: flex; flex-direction: column; gap: 8px; max-height: 80vh; overflow-y: auto; }
+        .card { background: linear-gradient(135deg, #e67e22, #d35400); font-size: 10px; padding: 8px; border-radius: 6px; cursor: pointer; border: 2px solid #fff; color: #fff; text-align: center; }
+        .card:disabled { opacity: 0.4; filter: grayscale(1); }
+        .card.locked { background: #34495e !important; border-color: #95a5a6; }
+        
+        .score-box { background: rgba(0,0,0,0.4); padding: 10px 20px; border-radius: 30px; margin: 10px; border: 1px solid rgba(255,255,255,0.1); }
+        button.main-btn { padding: 10px 20px; cursor: pointer; font-weight: bold; background: var(--gold); border: none; border-radius: 5px; margin: 5px; color: #000; }
+    </style>
+</head>
+<body>
+
+<div id="lobby-screen" class="overlay">
+    <div class="modal">
+        <h2 style="color:var(--gold);">OTHELLO EXTREME ONLINE</h2>
+        <div>
+            <button class="main-btn" onclick="preCreate(2)">2人プレイ</button>
+            <button class="main-btn" onclick="preCreate(3)">3人プレイ</button>
+            <div style="margin-top:10px;"><label><input type="checkbox" id="card-toggle" checked> カードあり</label></div>
+        </div>
+        <hr style="margin:20px 0; border-color: #444;">
+        <input type="text" id="room-input" placeholder="CODE" style="padding:10px; width:100px; text-transform: uppercase;">
+        <button class="main-btn" onclick="joinRoom()">参加</button>
+    </div>
+</div>
+
+<div id="game-ui" style="display:none;">
+    <div class="score-box" style="text-align:center;">
+        <span id="s-0">1P: 0</span> | <span id="s-1">2P: 0</span> <span id="s-area-2">| <span id="s-2">3P: 0</span></span>
+        <span id="msg" style="margin-left:20px; font-weight:bold; color:var(--gold);"></span>
+    </div>
+    <div class="game-container">
+        <div class="side-area" id="cards-black"></div>
+        <div id="board" class="board"></div>
+        <div class="side-area" id="cards-white"></div>
+        <div class="side-area" id="cards-red" style="display:none;"></div>
+    </div>
+</div>
+
+<script>
+const socket = io();
+const players = ['black', 'white', 'red'];
+let myIdx = null, myRoomId = null, config = {};
+let board = [], bonusMap = [], turnIdx = 0, turnCounter = 0;
+let playerCards = { black: [], white: [], red: [] };
+let skipNextPlayer = false;
+
+// 提供されたコード準拠のアイテムリスト
+const CARD_TYPES = [
+    { id: 0,  name: "四隅奪取", desc: "空の角を奪う" },
+    { id: 1,  name: "中央制圧", desc: "中央付近を奪う" },
+    { id: 2,  name: "石泥棒", desc: "敵石3つを自分の色に" },
+    { id: 3,  name: "小型爆撃", desc: "敵石2つをランダム消去" },
+    { id: 4,  name: "色反転", desc: "盤面の色をサイクル変換" },
+    { id: 5,  name: "横一文字", desc: "ランダムな1行を奪う" },
+    { id: 7,  name: "縦一文字", desc: "ランダムな1列を奪う" },
+    { id: 8,  name: "斜め一閃", desc: "斜めラインを奪う" },
+    { id: 10, name: "手札交換", desc: "自分の手札を全交換" },
+    { id: 12, name: "ランダム化", desc: "空きマス1つを奪う" },
+    { id: 13, name: "ブラックホール", desc: "敵の石を5つ消去" },
+    { id: 16, name: "強制パス", desc: "次の相手のターンを飛ばす" },
+    { id: 17, name: "黄金の風", desc: "ボーナスを3つ生成" },
+    { id: 18, name: "大逆転", desc: "最下位の時、敵石5つ奪取" },
+    { id: 20, name: "十字砲火", desc: "盤面を十字に染め上げる" },
+    { id: 21, name: "毒霧", desc: "ランダム5マスを空地化" }
+];
+
+function preCreate(n) {
+    socket.emit('create-room', { maxPlayers: n, useCards: document.getElementById('card-toggle').checked });
+}
+
+function joinRoom() {
+    const id = document.getElementById('room-input').value.toUpperCase();
+    if(id) socket.emit('join-room', id);
+}
+
+socket.on('init', data => {
+    myIdx = data.myIdx; myRoomId = data.roomId; config = data.config;
+    document.getElementById('lobby-screen').style.display = 'none';
+});
+
+socket.on('game-start-broadcast', () => {
+    document.getElementById('game-ui').style.display = 'block';
+    if(config.maxPlayers === 3) document.getElementById('cards-red').style.display = 'flex';
+    else document.getElementById('s-area-2').style.display = 'none';
+    initGame();
+});
+
+// サーバーからのアクション同期
+socket.on('receive-action', data => {
+    if(data.type === 'move') {
+        board[data.r][data.c] = data.player;
+        flip(data.r, data.c, data.player);
+        if(bonusMap[data.r][data.c]) {
+            bonusMap[data.r][data.c] = false;
+            if(config.useCards && playerCards[data.player].length < 5) {
+                playerCards[data.player].push(getRandomCard());
+            }
+        }
+        processNextTurn();
+    } else if(data.type === 'card') {
+        executeCardEffect(data.player, data.cardId);
+        // カード使用後の手札削除
+        const idx = playerCards[data.player].findIndex(c => c.id === data.cardId);
+        if(idx !== -1) playerCards[data.player].splice(idx, 1);
+        if(data.cardId !== 16) processNextTurn();
+        else render();
+    }
+});
+
+function initGame() {
+    const size = config.maxPlayers === 2 ? 8 : 12;
+    board = Array.from({ length: size }, () => Array(size).fill(null));
+    bonusMap = Array.from({ length: size }, () => Array(size).fill(false));
+    config.bonusPositions.forEach(p => bonusMap[p.r][p.c] = true);
+
+    const mid = size / 2;
+    board[mid-1][mid-1] = 'white'; board[mid-1][mid] = 'black';
+    board[mid][mid-1] = 'black'; board[mid][mid] = 'white';
+    if(config.maxPlayers === 3) board[mid-2][mid] = 'red';
+
+    players.forEach(p => {
+        playerCards[p] = config.useCards ? [getRandomCard(), getRandomCard(), getRandomCard()] : [];
+    });
+    render();
+}
+
+function getRandomCard() { return {...CARD_TYPES[Math.floor(Math.random()*CARD_TYPES.length)]}; }
+
+function render() {
+    const el = document.getElementById('board');
+    const size = board.length;
+    const cellSize = size === 8 ? 45 : 32;
+    el.style.gridTemplateColumns = `repeat(${size}, ${cellSize}px)`;
+    el.innerHTML = '';
+    
+    document.body.className = `${players[turnIdx]}-turn`;
+    document.getElementById('msg').innerText = (turnIdx === myIdx) ? "あなたの番です" : "相手の番です...";
+
+    for(let r=0; r<size; r++) {
+        for(let c=0; c<size; c++) {
+            const cell = document.createElement('div');
+            cell.className = `cell ${bonusMap[r][c]?'bonus':''}`;
+            cell.style.width = cell.style.height = cellSize + 'px';
+            if(board[r][c]) {
+                const s = document.createElement('div');
+                s.className = `stone ${board[r][c]}`;
+                cell.appendChild(s);
+            } else if(turnIdx === myIdx && isValid(r, c, players[turnIdx])) {
+                const h = document.createElement('div');
+                h.className = 'hint';
+                cell.appendChild(h);
+            }
+            cell.onclick = () => { if(turnIdx === myIdx) requestMove(r, c); };
+            el.appendChild(cell);
+        }
+    }
+    updateUI();
+}
+
+function requestMove(r, c) {
+    if(isValid(r, c, players[turnIdx])) {
+        socket.emit('sync-action', { type: 'move', r, c, player: players[turnIdx], roomId: myRoomId });
+    }
+}
+
+function processNextTurn() {
+    turnCounter++;
+    if(skipNextPlayer) {
+        turnIdx = (turnIdx + 1) % config.maxPlayers;
+        skipNextPlayer = false;
+    }
+    turnIdx = (turnIdx + 1) % config.maxPlayers;
+    render();
+}
+
+function useCard(idx) {
+    if(turnIdx !== myIdx) return;
+    const card = playerCards[players[myIdx]][idx];
+    socket.emit('sync-action', { type: 'card', player: players[myIdx], cardId: card.id, roomId: myRoomId });
+}
+
+function executeCardEffect(player, cardId) {
+    const size = board.length;
+    const allCells = [];
+    for(let r=0; r<size; r++) for(let c=0; c<size; c++) allCells.push({r, c, v: board[r][c]});
+
+    switch(cardId) {
+        case 0: [[0,0],[0,size-1],[size-1,0],[size-1,size-1]].forEach(([r,c])=>board[r][c]=player); break;
+        case 1: const m = size/2; for(let r=m-1; r<=m; r++) for(let c=m-1; c<=m; c++) board[r][c]=player; break;
+        case 2: shuffle(allCells).filter(c=>c.v && c.v!==player).slice(0,3).forEach(c=>board[c.r][c.c]=player); break;
+        case 3: shuffle(allCells).filter(c=>c.v && c.v!==player).slice(0,2).forEach(c=>board[c.r][c.c]=null); break;
+        case 4: board = board.map(r => r.map(v => !v ? null : (config.maxPlayers === 2 ? (v==='black'?'white':'black') : (v==='black'?'white':v==='white'?'red':'black')))); break;
+        case 5: const row = Math.floor(Math.random()*size); for(let i=0; i<size; i++) board[row][i]=player; break;
+        case 7: const col = Math.floor(Math.random()*size); for(let i=0; i<size; i++) board[i][col]=player; break;
+        case 10: playerCards[player] = [getRandomCard(), getRandomCard(), getRandomCard()]; break;
+        case 16: skipNextPlayer = true; break;
+        case 17: for(let i=0; i<3; i++){ let r=Math.floor(Math.random()*size),c=Math.floor(Math.random()*size); bonusMap[r][c]=true; } break;
+        case 20: const tr=Math.floor(size/2), tc=Math.floor(size/2); for(let i=0; i<size; i++){ board[tr][i]=player; board[i][tc]=player; } break;
+        case 21: shuffle(allCells).filter(c=>c.v).slice(0,5).forEach(c=>board[c.r][c.c]=null); break;
+    }
+}
+
+function updateUI() {
+    players.forEach((p, i) => {
+        const score = board.flat().filter(v => v === p).length;
+        document.getElementById(`s-${i}`).innerText = `${i+1}P: ${score}`;
+        
+        const area = document.getElementById(`cards-${p}`);
+        area.innerHTML = `<div style="font-size:10px; margin-bottom:5px; color:#aaa;">${p.toUpperCase()} HAND</div>`;
+        playerCards[p].forEach((c, ci) => {
+            const btn = document.createElement('button');
+            // 【修正】全員が2ターン終わるまで(＝4手以上)封印
+            const isLocked = turnCounter < 4;
+            btn.className = `card ${isLocked ? 'locked' : ''}`;
+            btn.innerHTML = `<b>${c.name}</b><br>${isLocked ? '封印中(2T)' : c.desc}`;
+            btn.disabled = (turnIdx !== myIdx || isLocked || p !== players[myIdx]);
+            btn.onclick = () => useCard(ci);
+            area.appendChild(btn);
+        });
+    });
+}
+
+// ヘルパー
+function isValid(r, c, p) {
+    if(board[r][c]) return false;
+    const dirs = [[0,1],[0,-1],[1,0],[-1,0],[1,1],[1,-1],[-1,1],[-1,-1]];
+    return dirs.some(([dr, dc]) => {
+        let x = r+dr, y = c+dc, f = false;
+        while(x>=0 && x<board.length && y>=0 && y<board.length && board[x][y] && board[x][y] !== p) {
+            x+=dr; y+=dc; f = true;
+        }
+        return f && x>=0 && x<board.length && y>=0 && y<board.length && board[x][y] === p;
+    });
+}
+function flip(r, c, p) {
+    const dirs = [[0,1],[0,-1],[1,0],[-1,0],[1,1],[1,-1],[-1,1],[-1,-1]];
+    dirs.forEach(([dr, dc]) => {
+        let x = r+dr, y = c+dc, ts = [];
+        while(x>=0 && x<board.length && y>=0 && y<board.length && board[x][y] && board[x][y] !== p) {
+            ts.push([x, y]); x+=dr; y+=dc;
+        }
+        if(ts.length && x>=0 && x<board.length && y>=0 && y<board.length && board[x][y] === p) {
+            ts.forEach(([tx, ty]) => board[tx][ty] = p);
+        }
+    });
+}
+function shuffle(a) { for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]];} return a; }
+</script>
+</body>
+</html>
