@@ -1,0 +1,2 @@
+# online-Othello
+オセロだあ
