@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <script src="/socket.io/socket.io.js"></script>
+    <style>
+        :root { --bg-black: #1a252f; --bg-white: #e8f5e9; --bg-red: #3e1a1a; --board-green: #2e7d32; --gold: #ffd700; }
+        body { font-family: sans-serif; margin: 0; display: flex; flex-direction: column; align-items: center; background: #111; color: #fff; transition: 0.5s; overflow-x: hidden; }
+        body.black-turn { background-color: var(--bg-black); }
+        body.white-turn { background-color: var(--bg-white); color: #333; }
+        body.red-turn { background-color: var(--bg-red); }
+        
+        .overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.9); z-index: 1000; display: flex; justify-content: center; align-items: center; }
+        .modal { background: #222; padding: 25px; border-radius: 15px; text-align: center; border: 2px solid var(--gold); width: 320px; }
+        
+        .game-container { display: flex; gap: 15px; padding: 10px; align-items: flex-start; }
+        .board { display: grid; background: var(--board-green); border: 5px solid #1b5e20; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+        .cell { border: 0.5px solid rgba(255,255,255,0.1); display: flex; justify-content: center; align-items: center; cursor: pointer; position: relative; }
+        .cell.bonus { background: rgba(255, 215, 0, 0.2); }
+        .cell.bonus::after { content: '★'; color: var(--gold); font-size: 14px; position: absolute; font-weight: bold; }
+        
+        .stone { border-radius: 50%; width: 85%; height: 85%; transition: 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
+        .black { background: radial-gradient(circle at 30% 30%, #444, #000); }
+        .white { background: radial-gradient(circle at 30% 30%, #fff, #ccc); }
+        .red { background: radial-gradient(circle at 30% 30%, #ff5555, #880000); }
+        .hint { width: 10px; height: 10px; background: rgba(255,255,255,0.3); border-radius: 50%; }
+
+        .side-area { width: 110px; display: flex; flex-direction: column; gap: 8px; }
+        .card { background: linear-gradient(135deg, #e67e22, #d35400); font-size: 9px; padding: 6px; border-radius: 5px; cursor: pointer; border: 1px solid #fff; color: #fff; text-align: center; }
+        .card:disabled { opacity: 0.3; cursor: not-allowed; filter: grayscale(1); }
+        .score-box { background: rgba(0,0,0,0.4); padding: 10px 20px; border-radius: 30px; margin: 10px; border: 1px solid rgba(255,255,255,0.1); }
+        button { padding: 10px; cursor: pointer; font-weight: bold; background: var(--gold); border: none; border-radius: 5px; margin: 5px; }
+        input[type="checkbox"] { transform: scale(1.5); margin-right: 10px; }
+    </style>
+</head>
+<body>
+
+<div id="lobby-screen" class="overlay">
+    <div class="modal">
+        <h2 style="color:var(--gold); margin-top:0;">OTHELLO EXTREME</h2>
+        <div id="create-area">
+            <p style="font-size:12px;">【ホスト設定】</p>
+            <button onclick="preCreate(2)">2人プレイ</button>
+            <button onclick="preCreate(3)">3人プレイ</button>
+            <div style="margin-top:10px;">
+                <label><input type="checkbox" id="card-toggle" checked> カードあり</label>
+            </div>
+        </div>
+        <hr style="margin:20px 0; border-color: #444;">
+        <div id="join-area">
+            <input type="text" id="room-input" placeholder="コード入力" style="padding:10px; width:120px; text-transform: uppercase;">
+            <button onclick="joinRoom()">参加</button>
+        </div>
+    </div>
+</div>
+
+<div id="wait-screen" class="overlay" style="display:none;">
+    <div class="modal">
+        <h2>待機中...</h2>
+        <p>ROOM CODE: <span id="display-room-id" style="color:var(--gold); font-size:28px; letter-spacing:2px;"></span></p>
+        <p id="wait-msg">プレイヤーを待っています...</p>
+    </div>
+</div>
+
+<div id="game-ui" style="display:none; text-align:center;">
+    <div class="score-box">
+        <span id="s-0">1P: 0</span> | <span id="s-1">2P: 0</span> <span id="s-area-2">| <span id="s-2">3P: 0</span></span>
+        <span id="msg" style="margin-left:20px; font-weight:bold;"></span>
+    </div>
+    <div class="game-container">
+        <div class="side-area" id="cards-0"></div>
+        <div id="board" class="board"></div>
+        <div class="side-area" id="cards-1"></div>
+        <div class="side-area" id="cards-2" style="display:none;"></div>
+    </div>
+</div>
+
+<script>
+const socket = io();
+const CARD_TYPES = [
+    { id: 0, name: "四隅奪取", desc: "空の角を奪う" },
+    { id: 1, name: "中央制圧", desc: "中心4マスを奪う" },
+    { id: 2, name: "石泥棒", desc: "敵石3つを自分の色に" },
+    { id: 3, name: "色反転", desc: "全員の石を入れ替え" },
+    { id: 4, name: "横一文字", desc: "ランダム一行を奪う" }
+];
+
+let myIdx = null, myRoomId = null, config = {};
+let board = [], bonusMap = [], players = ['black', 'white', 'red'], turnIdx = 0;
+let myCards = [];
+
+function preCreate(n) {
+    socket.emit('create-room', { 
+        maxPlayers: n, 
+        useCards: document.getElementById('card-toggle').checked 
+    });
+}
+
+function joinRoom() {
+    const id = document.getElementById('room-input').value.toUpperCase();
+    if(id) socket.emit('join-room', id);
+}
+
+socket.on('init', data => {
+    myIdx = data.myIdx;
+    myRoomId = data.roomId;
+    config = data.config;
+    document.getElementById('lobby-screen').style.display = 'none';
+    document.getElementById('wait-screen').style.display = 'flex';
+    document.getElementById('display-room-id').innerText = myRoomId;
+});
+
+socket.on('update-waiting', data => {
+    document.getElementById('wait-msg').innerText = `プレイヤーを待っています (${data.current} / ${data.max})`;
+});
+
+socket.on('game-start-broadcast', () => {
+    document.getElementById('wait-screen').style.display = 'none';
+    document.getElementById('game-ui').style.display = 'block';
+    if(config.maxPlayers === 3) document.getElementById('cards-2').style.display = 'flex';
+    else document.getElementById('s-area-2').style.display = 'none';
+    initGame();
+});
+
+socket.on('receive-action', data => {
+    if(data.type === 'move') executeMove(data.r, data.c, false);
+    if(data.type === 'card') executeCardEffect(data.cardId, data.senderIdx, false);
+});
+
+function initGame() {
+    const size = config.maxPlayers === 2 ? 8 : 12;
+    board = Array.from({ length: size }, () => Array(size).fill(null));
+    bonusMap = Array.from({ length: size }, () => Array(size).fill(false));
+    
+    // ホストが作成したボーナス配置を適用
+    config.bonusPositions.forEach(pos => bonusMap[pos.r][pos.c] = true);
+
+    const mid = size / 2;
+    board[mid-1][mid-1] = 'white'; board[mid-1][mid] = 'black';
+    board[mid][mid-1] = 'black'; board[mid][mid] = 'white';
+    if(config.maxPlayers === 3) board[mid-2][mid] = 'red';
+
+    if(config.useCards) {
+        myCards = [getRandomCard(), getRandomCard()];
+    }
+    render();
+}
+
+function getRandomCard() { return CARD_TYPES[Math.floor(Math.random()*CARD_TYPES.length)]; }
+
+function render() {
+    const el = document.getElementById('board');
+    const size = config.maxPlayers === 2 ? 8 : 12;
+    const cellSize = size === 8 ? 45 : 32;
+    el.style.gridTemplateColumns = `repeat(${size}, ${cellSize}px)`;
+    el.innerHTML = '';
+    
+    document.body.className = `${players[turnIdx]}-turn`;
+    document.getElementById('msg').innerText = (turnIdx === myIdx) ? "あなたの番です" : "相手の番です...";
+
+    for(let r=0; r<size; r++) {
+        for(let c=0; c<size; c++) {
+            const cell = document.createElement('div');
+            cell.className = `cell ${bonusMap[r][c]?'bonus':''}`;
+            cell.style.width = cell.style.height = cellSize + 'px';
+            if(board[r][c]) {
+                const s = document.createElement('div');
+                s.className = `stone ${board[r][c]}`;
+                cell.appendChild(s);
+            } else if(turnIdx === myIdx && isValid(r, c, players[turnIdx])) {
+                const h = document.createElement('div');
+                h.className = 'hint';
+                cell.appendChild(h);
+            }
+            cell.onclick = () => { if(turnIdx === myIdx) requestMove(r, c); };
+            el.appendChild(cell);
+        }
+    }
+    updateScoreAndCards();
+}
+
+function requestMove(r, c) {
+    if(isValid(r, c, players[turnIdx])) executeMove(r, c, true);
+}
+
+function executeMove(r, c, isLocal) {
+    if(isLocal) socket.emit('sync-action', { type:'move', r, c, roomId: myRoomId });
+    
+    board[r][c] = players[turnIdx];
+    flip(r, c, players[turnIdx]);
+
+    if(bonusMap[r][c]) {
+        bonusMap[r][c] = false;
+        if(isLocal && config.useCards && myCards.length < 5) myCards.push(getRandomCard());
+    }
+    
+    turnIdx = (turnIdx + 1) % config.maxPlayers;
+    render();
+}
+
+function useCard(cardIdx) {
+    if(turnIdx !== myIdx) return;
+    const card = myCards[cardIdx];
+    socket.emit('sync-action', { type:'card', cardId: card.id, senderIdx: myIdx, roomId: myRoomId });
+    executeCardEffect(card.id, myIdx, true);
+    myCards.splice(cardIdx, 1);
+}
+
+function executeCardEffect(id, senderIdx, isLocal) {
+    const p = players[senderIdx];
+    const size = board.length;
+    if(id === 0) { // 四隅
+        [[0,0],[0,size-1],[size-1,0],[size-1,size-1]].forEach(([r,c]) => board[r][c] = p);
+    } else if(id === 1) { // 中央
+        const m = size/2;
+        board[m-1][m-1] = board[m-1][m] = board[m][m-1] = board[m][m] = p;
+    } else if(id === 2) { // 石泥棒
+        let count = 0;
+        for(let i=0; i<size*size && count<3; i++) {
+            let r = Math.floor(Math.random()*size), c = Math.floor(Math.random()*size);
+            if(board[r][c] && board[r][c] !== p) { board[r][c] = p; count++; }
+        }
+    } else if(id === 4) { // 横一文字
+        const r = Math.floor(Math.random()*size);
+        for(let i=0; i<size; i++) board[r][i] = p;
+    }
+    render();
+}
+
+function updateScoreAndCards() {
+    players.forEach((p, i) => {
+        const score = board.flat().filter(v => v === p).length;
+        document.getElementById(`s-${i}`).innerText = `${i+1}P: ${score}`;
+        
+        const cardArea = document.getElementById(`cards-${i}`);
+        cardArea.innerHTML = `<p style="font-size:10px; margin:0;">${i+1}P カード</p>`;
+        if(i === myIdx && config.useCards) {
+            myCards.forEach((c, ci) => {
+                const btn = document.createElement('button');
+                btn.className = 'card';
+                btn.innerHTML = `<b>${c.name}</b><br>${c.desc}`;
+                btn.disabled = (turnIdx !== myIdx);
+                btn.onclick = () => useCard(ci);
+                cardArea.appendChild(btn);
+            });
+        }
+    });
+}
+
+function isValid(r, c, p) {
+    if(board[r][c]) return false;
+    const dirs = [[0,1],[0,-1],[1,0],[-1,0],[1,1],[1,-1],[-1,1],[-1,-1]];
+    return dirs.some(([dr, dc]) => {
+        let x = r+dr, y = c+dc, found = false;
+        while(x>=0 && x<board.length && y>=0 && y<board.length && board[x][y] && board[x][y] !== p) {
+            x+=dr; y+=dc; found = true;
+        }
+        return found && x>=0 && x<board.length && y>=0 && y<board.length && board[x][y] === p;
+    });
+}
+
+function flip(r, c, p) {
+    const dirs = [[0,1],[0,-1],[1,0],[-1,0],[1,1],[1,-1],[-1,1],[-1,-1]];
+    dirs.forEach(([dr, dc]) => {
+        let x = r+dr, y = c+dc, targets = [];
+        while(x>=0 && x<board.length && y>=0 && y<board.length && board[x][y] && board[x][y] !== p) {
+            targets.push([x, y]); x+=dr; y+=dc;
+        }
+        if(targets.length && x>=0 && x<board.length && y>=0 && y<board.length && board[x][y] === p) {
+            targets.forEach(([tx, ty]) => board[tx][ty] = p);
+        }
+    });
+}
+</script>
+</body>
+</html>
